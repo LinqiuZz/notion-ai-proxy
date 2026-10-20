@@ -279,7 +279,7 @@ ai-proxy/
 ├─ notion-proxy.js / notion-proxy.exe  # 核心源码 / Node SEA 打包产物（约 91MB，免安装 Node）
 ├─ config.json / start-proxy.cmd / update-cookie.cmd
 ├─ PROJECT-INTRO.md / README.md
-├─ examples/                # openai_python.py、curl_chat.cmd、batch_process.py（--thread-mode single|new）、auto_agent.py
+├─ examples/                # openai_python.py、attach_image.py（图片/文件附件）、curl_chat.cmd、batch_process.py（--thread-mode single|new）、auto_agent.py
 │                           # claude-code.cmd、claude-code-settings.json
 │                           # codex-notion.cmd、codex-notion.config.toml
 ├─ tools/                   # build-exe.ps1、cdp_cookie_extract.py
