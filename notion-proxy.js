@@ -78,6 +78,8 @@ const DEFAULT_CONFIG = {
   threadReuseMaxTurns: 30, // single 模式下，同一会话最多复用多少轮，超过就换新会话
   threadReuseMaxInputTokens: 300000, // single 模式下，单次输入超过这个 token 数就换新会话
   threadStateFile: 'secret/thread-state.json',
+  enableAttachments: true, // 支持图片/文件附件（走 Notion 聊天专用上传接口）
+  attachmentMaxBytes: 14680064, // 单个附件上限 14MB（Notion 签名策略上限 20MB）
   clientVersion: '23.13.20260720.1949',
   userAgent:
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -419,6 +421,409 @@ function callNotion({ pathname, payload, onRecord, timeoutMs }) {
 
 function isCloudflareBlock(text) {
   return /just a moment|cf-chl|challenges\.cloudflare\.com|attention required/i.test(text || '');
+}
+
+// ───────────────────────────── 附件（图片 / 文件） ─────────────────────────────
+// Notion 网页 AI 支持在对话里附带文件，走专用上传接口（2026-10 抓包确认）：
+//   1. POST /api/v3/getUploadFileUrlForAssistantChatTranscriptUpload -> 返回 S3 签名 POST 字段
+//   2. multipart POST 到 signedUploadPostUrl                          -> 上传文件实体
+//   3. POST /api/v3/processAgentAttachment                            -> 触发解析/审核（返回可忽略）
+//   4. runInferenceTranscript 的 transcript 里插入
+//      { id, type: "attachment", fileUrl, fileName, contentType, metadata }
+// 关键：fileUrl 与 thread 绑定，跨 thread 引用会“图片加载不出来”，所以上传前 thread 必须已存在。
+// 新会话模式下先用 saveTransactionsFanout 建空 thread record，再上传，最后用 createThread:false 发请求。
+
+const EXT_BY_MIME = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'application/pdf': '.pdf',
+  'text/plain': '.txt',
+  'text/markdown': '.md',
+  'text/csv': '.csv',
+  'application/json': '.json',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+  'application/zip': '.zip',
+};
+
+const EXT_BY_NAME = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.csv': 'text/csv',
+  '.json': 'application/json',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.zip': 'application/zip',
+};
+
+function sniffMime(buf) {
+  if (!buf || buf.length < 4) return '';
+  const b = buf;
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  if (b.slice(0, 6).toString('ascii') === 'GIF87a' || b.slice(0, 6).toString('ascii') === 'GIF89a')
+    return 'image/gif';
+  if (b.slice(0, 4).toString('ascii') === 'RIFF' && b.slice(8, 12).toString('ascii') === 'WEBP')
+    return 'image/webp';
+  if (b.slice(0, 4).toString('ascii') === '%PDF') return 'application/pdf';
+  if (b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04)
+    return 'application/zip';
+  return '';
+}
+
+function imageDimensions(buf, mimeType) {
+  try {
+    if (mimeType === 'image/png' && buf.length >= 24) {
+      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    }
+    if (mimeType === 'image/gif' && buf.length >= 10) {
+      return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+    }
+    if (mimeType === 'image/jpeg') {
+      let i = 2;
+      while (i + 9 < buf.length) {
+        if (buf[i] !== 0xff) break;
+        const marker = buf[i + 1];
+        const len = buf.readUInt16BE(i + 2);
+        if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+          return { height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
+        }
+        i += 2 + len;
+      }
+    }
+  } catch (_) {
+    /* 解析失败就不带尺寸 */
+  }
+  return null;
+}
+
+function extByName(name) {
+  const m = String(name || '').toLowerCase().match(/\.[a-z0-9]{1,8}$/);
+  return m ? m[0] : '';
+}
+
+// 文本类文件在 Notion 里用 computer-file step（AI 通过 computer 工具 uploadFile + cat 读取），
+// 图片/PDF 等二进制文件用 attachment step（走视觉/文档解析）。抓包确认（2026-10）。
+const TEXTY_EXT = new Set([
+  '.txt', '.md', '.markdown', '.csv', '.json', '.yaml', '.yml', '.xml', '.log', '.ini', '.toml',
+  '.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.java', '.c', '.cpp', '.h', '.hpp', '.go',
+  '.rs', '.rb', '.php', '.sh', '.bash', '.zsh', '.ps1', '.bat', '.cmd', '.sql', '.html', '.htm',
+  '.css', '.scss', '.less', '.vue', '.lua', '.r', '.pl', '.kt', '.swift', '.dart',
+]);
+
+function isTextLikeAttachment(mimeType, name) {
+  if (TEXTY_EXT.has(extByName(name))) return true;
+  const mime = String(mimeType || '').toLowerCase();
+  return mime.startsWith('text/') || /^application\/(json|xml|x-ndjson|yaml|x-yaml|csv)\b/.test(mime);
+}
+
+// 用 curl 跑一次请求（二进制安全），用于下载图片 / 上传到 S3
+function execCurl(args, inputBuffer) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(cfg.curlPath, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) {
+      reject(new Error(`无法启动 ${cfg.curlPath}: ${e.message}`));
+      return;
+    }
+    const out = [];
+    const err = [];
+    child.stdout.on('data', (d) => out.push(d));
+    child.stderr.on('data', (d) => err.push(d));
+    child.on('error', (e) => reject(new Error(`curl 启动失败: ${e.message}`)));
+    child.on('close', (code) =>
+      resolve({
+        stdout: Buffer.concat(out),
+        stderr: Buffer.concat(err).toString('utf8').trim(),
+        exitCode: code,
+      })
+    );
+    child.stdin.on('error', () => {
+      /* 忽略 EPIPE */
+    });
+    child.stdin.end(inputBuffer || Buffer.alloc(0));
+  });
+}
+
+async function notionJson(pathname, payload) {
+  const res = await callNotion({ pathname, payload });
+  const text = String(res.raw || '').trim();
+  let obj = res.records && res.records[0];
+  if (!obj && text) {
+    try {
+      obj = JSON.parse(text);
+    } catch (_) {
+      obj = null;
+    }
+  }
+  if (res.status !== 200 || !obj) {
+    const detail = obj && (obj.message || obj.name) ? `${obj.name || 'Error'}: ${obj.message || ''}` : text.slice(0, 300);
+    throw new HttpError(502, `Notion ${pathname} 失败（HTTP ${res.status}）${detail ? ': ' + detail : ''}`);
+  }
+  return obj;
+}
+
+// 新会话 + 带附件时：先建一个空的 thread record，让上传接口有可绑定的 thread
+async function createThreadRecord(threadId) {
+  const spaceId = state.workspace.spaceId;
+  const userId = state.cred.notion_user_id || state.workspace.userId || '';
+  const nowMs = Date.now();
+  await notionJson('/api/v3/saveTransactionsFanout', {
+    requestId: uuid(),
+    transactions: [
+      {
+        id: uuid(),
+        spaceId,
+        debug: { userAction: 'WorkflowActions.createThread', clientCommitTimeMs: nowMs },
+        operations: [
+          {
+            pointer: { table: 'thread', id: threadId, spaceId },
+            path: [],
+            command: 'set',
+            args: {
+              id: threadId,
+              version: 0,
+              space_id: spaceId,
+              parent_id: spaceId,
+              parent_table: 'space',
+              created_by_id: userId,
+              created_by_table: 'notion_user',
+              created_time: nowMs,
+              messages: [],
+              data: {},
+            },
+          },
+        ],
+      },
+    ],
+  });
+  return threadId;
+}
+
+function loadAttachmentData(item) {
+  const maxBytes = Number(cfg.attachmentMaxBytes) || 14680064;
+  return (async () => {
+    let buffer = null;
+    let mimeType = item.mimeType || '';
+    let name = item.name || '';
+    if (item.url) {
+      const url = String(item.url);
+      const dataMatch = url.match(/^data:([^;,]+)?(;base64)?,([\s\S]*)$/);
+      if (dataMatch) {
+        mimeType = mimeType || dataMatch[1] || '';
+        buffer = dataMatch[2] ? Buffer.from(dataMatch[3], 'base64') : Buffer.from(decodeURIComponent(dataMatch[3]));
+      } else {
+        const res = await execCurl(['-sS', '-L', '--max-time', '180', url]);
+        if (res.exitCode !== 0) throw new HttpError(400, `下载附件失败: ${res.stderr.slice(0, 200)}`);
+        buffer = res.stdout;
+        const ct = res.stderr ? '' : '';
+        void ct;
+      }
+    } else if (item.dataBase64) {
+      buffer = Buffer.from(String(item.dataBase64), 'base64');
+    } else if (item.text) {
+      buffer = Buffer.from(String(item.text), 'utf8');
+      mimeType = mimeType || 'text/plain';
+    }
+    if (!buffer || !buffer.length) throw new HttpError(400, '附件内容为空');
+    if (buffer.length > maxBytes) {
+      throw new HttpError(413, `附件过大（${buffer.length} 字节，上限 ${maxBytes}）`);
+    }
+    mimeType = mimeType || sniffMime(buffer) || 'application/octet-stream';
+    if (!name) {
+      const ext = EXT_BY_MIME[mimeType] || (mimeType.startsWith('image/') ? '.' + mimeType.split('/')[1] : '.bin');
+      name = `attachment${ext}`;
+    }
+    return { buffer, mimeType, name };
+  })();
+}
+
+// 上传单个附件，返回可直接放进 transcript 的 attachment step
+async function uploadAttachment({ spaceId, threadId, buffer, mimeType, name }) {
+  const ext = extByName(name) || EXT_BY_MIME[mimeType] || '.bin';
+  const storedName = `${uuid()}${ext}`;
+  const urlResp = await notionJson('/api/v3/getUploadFileUrlForAssistantChatTranscriptUpload', {
+    name: storedName,
+    contentType: mimeType,
+    contentLength: buffer.length,
+    assistantChatTranscriptSessionPointer: { spaceId, table: 'thread', id: threadId },
+    createThread: true,
+    agentMemorySettings: { useMemories: true, excludeChatFromMemories: false },
+  });
+  if (!urlResp.url || !urlResp.signedUploadPostUrl) {
+    throw new HttpError(502, '上传附件失败：Notion 没有返回签名地址');
+  }
+
+  const boundary = `----aiProxy${uuid().replace(/-/g, '')}`;
+  const parts = [];
+  for (const [key, value] of Object.entries(urlResp.fields || {})) {
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`));
+  }
+  parts.push(
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${storedName}"\r\n` +
+        `Content-Type: ${mimeType}\r\n\r\n`
+    )
+  );
+  parts.push(buffer);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+
+  const args = [
+    '-sS',
+    '--max-time',
+    '180',
+    '-X',
+    'POST',
+    urlResp.signedUploadPostUrl,
+    '--data-binary',
+    '@-',
+    '-H',
+    `Content-Type: multipart/form-data; boundary=${boundary}`,
+    '-w',
+    '\n__STATUS__%{http_code}',
+  ];
+  for (const h of urlResp.postHeaders || []) {
+    if (h && h.name) args.push('-H', `${h.name}: ${h.value}`);
+  }
+  const up = await execCurl(args, Buffer.concat(parts));
+  const upText = up.stdout.toString('utf8');
+  const statusMatch = upText.match(/__STATUS__(\d{3})/);
+  const upStatus = statusMatch ? Number(statusMatch[1]) : 0;
+  if (upStatus !== 200 && upStatus !== 201 && upStatus !== 204) {
+    throw new HttpError(502, `上传附件到 S3 失败（HTTP ${upStatus || '?'}）`);
+  }
+
+  // 触发服务端解析/审核（图片、PDF 的元数据由它生成；失败不阻塞）
+  try {
+    await notionJson('/api/v3/processAgentAttachment', {
+      url: urlResp.url,
+      spaceId,
+      aiSessionPointer: { spaceId, table: 'thread', id: threadId },
+      permissionRecord: { spaceId, table: 'thread', id: threadId },
+      source: 'user_upload',
+      clientVersion: cfg.clientVersion,
+      model: (state.registry && state.registry.entries && state.registry.entries[0] && state.registry.entries[0].code) || '',
+    });
+  } catch (e) {
+    log('processAgentAttachment 失败（忽略）:', e.message);
+  }
+
+  const metadata = {
+    fileSizeBytes: buffer.length,
+    attachmentSource: 'user_upload',
+    aiTraceId: uuid(),
+    guardrail: { inferenceId: uuid(), attachmentRisk: 'skipped' },
+    moderation: { status: 'passed' },
+    estimatedTokens: { openai: Math.max(1, Math.round(buffer.length / 4)), anthropic: 0 },
+  };
+  const dims = imageDimensions(buffer, mimeType);
+  if (dims && dims.width && dims.height) {
+    metadata.width = dims.width;
+    metadata.height = dims.height;
+  }
+
+  // 文本类文件：computer-file（AI 用 computer 工具读取）；其余：attachment（视觉/文档解析）
+  if (isTextLikeAttachment(mimeType, name)) {
+    return {
+      id: uuid(),
+      type: 'computer-file',
+      fileUrl: urlResp.url,
+      fileName: name,
+      contentType: mimeType,
+      metadata: { fileSize: buffer.length, attachmentSource: 'user_upload' },
+    };
+  }
+  return {
+    id: uuid(),
+    type: 'attachment',
+    fileUrl: urlResp.url,
+    fileName: name,
+    contentType: mimeType,
+    metadata,
+    base64EncodedFileUrl: '',
+  };
+}
+
+// 把上一轮解析出来的附件描述（url / base64 / text）变成 transcript steps；需要 thread 已存在
+async function prepareAttachmentSteps(items, spaceId, threadId) {
+  const steps = [];
+  for (const item of items) {
+    const loaded = await loadAttachmentData(item);
+    log(`上传附件 ${loaded.name}（${loaded.mimeType}, ${loaded.buffer.length} 字节）...`);
+    steps.push(await uploadAttachment({ spaceId, threadId, ...loaded }));
+  }
+  return steps;
+}
+
+// OpenAI 风格：最后一条 user 消息的 content 数组里的 image_url / file
+function extractOpenAIAttachments(rawMessages) {
+  const list = Array.isArray(rawMessages) ? rawMessages : [];
+  let lastUser = -1;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i] && typeof list[i] === 'object' && (list[i].role === 'user' || !list[i].role)) {
+      lastUser = i;
+      break;
+    }
+  }
+  if (lastUser < 0) return [];
+  const content = list[lastUser].content;
+  if (!Array.isArray(content)) return [];
+  const out = [];
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    if (part.type === 'image_url') {
+      const v = part.image_url;
+      const url = typeof v === 'string' ? v : v && v.url;
+      if (url) out.push({ url, name: (v && v.name) || '', mimeType: (v && v.mime_type) || '' });
+    } else if (part.type === 'input_image') {
+      const url = typeof part.image_url === 'string' ? part.image_url : part.image_url && part.image_url.url;
+      if (url) out.push({ url, name: part.filename || '', mimeType: part.mime_type || '' });
+    } else if (part.type === 'file' && part.file) {
+      out.push({
+        dataBase64: part.file.file_data || part.file.data || '',
+        name: part.file.filename || part.file.name || '',
+        mimeType: part.file.mime_type || part.file.type || '',
+      });
+    }
+  }
+  return out;
+}
+
+// Anthropic 风格：image / document block
+function extractAnthropicAttachments(rawMessages) {
+  const list = Array.isArray(rawMessages) ? rawMessages : [];
+  const out = [];
+  for (const m of list) {
+    if (!m || typeof m !== 'object' || m.role === 'assistant') continue;
+    const content = m.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      const src = block.source;
+      if (!src) continue;
+      if (block.type === 'image' || block.type === 'document') {
+        if (src.type === 'base64' && src.data) {
+          out.push({ dataBase64: src.data, mimeType: src.media_type || (block.type === 'image' ? 'image/png' : 'application/pdf'), name: block.title || '' });
+        } else if (src.type === 'url' && src.url) {
+          out.push({ url: src.url, mimeType: src.media_type || '', name: block.title || '' });
+        } else if (src.type === 'text' && src.data) {
+          out.push({ text: src.data, mimeType: src.media_type || 'text/plain', name: block.title || '' });
+        }
+      }
+    }
+  }
+  return out;
 }
 
 // ───────────────── 登录态刷新：直接从浏览器调试端口(CDP)读 cookie ─────────────────
@@ -994,9 +1399,14 @@ async function withSingleThreadLock(fn) {
   }
 }
 
-async function runWithThread({ entry, messages, threadType, webSearch, reasoningEffort, threadId, mode }) {
+async function runWithThread({ entry, messages, threadType, webSearch, reasoningEffort, threadId, mode, attachments }) {
+  const atts = Array.isArray(attachments) ? attachments : [];
+  const spaceId = state.workspace.spaceId;
+  const stepsFor = (tid) => prepareAttachmentSteps(atts, spaceId, tid);
+
   // 显式指定 threadId：直接追加到该会话（高级用法，不做状态管理）
   if (threadId) {
+    const attachmentSteps = atts.length ? await stepsFor(threadId) : [];
     const payload = buildPayload({
       entry,
       messages,
@@ -1006,29 +1416,55 @@ async function runWithThread({ entry, messages, threadType, webSearch, reasoning
       reasoningEffort,
       createThread: false,
       reuse: false,
+      attachmentSteps,
     });
     const parsed = await executeInference(payload, null, { threadId });
     return { parsed, thread: { mode: 'custom', threadId } };
   }
 
   if (mode !== 'single') {
+    if (!atts.length) {
+      const payload = buildPayload({
+        entry,
+        messages,
+        threadId: null,
+        threadType,
+        webSearch,
+        reasoningEffort,
+        createThread: true,
+        reuse: false,
+      });
+      const parsed = await executeInference(payload, null, { threadId: null });
+      return { parsed, thread: { mode: 'new', threadId: null } };
+    }
+    // 带附件：thread 必须先存在才能上传 -> 先建空 thread record，再上传，最后 createThread:false
+    const newThreadId = uuid();
+    await createThreadRecord(newThreadId);
+    const attachmentSteps = await stepsFor(newThreadId);
     const payload = buildPayload({
       entry,
       messages,
-      threadId: null,
+      threadId: newThreadId,
       threadType,
       webSearch,
       reasoningEffort,
-      createThread: true,
+      createThread: false,
       reuse: false,
+      attachmentSteps,
     });
-    const parsed = await executeInference(payload, null, { threadId: null });
-    return { parsed, thread: { mode: 'new', threadId: null } };
+    const parsed = await executeInference(payload, null, { threadId: newThreadId });
+    return { parsed, thread: { mode: 'new', threadId: newThreadId } };
   }
 
   return withSingleThreadLock(async () => {
     let thread = acquireThread('single');
     try {
+      let attachmentSteps = [];
+      if (atts.length) {
+        // single 模式首次请求时该会话在 Notion 端还不存在，先建 record 再上传
+        if (thread.createThread) await createThreadRecord(thread.threadId);
+        attachmentSteps = await stepsFor(thread.threadId);
+      }
       const payload = buildPayload({
         entry,
         messages,
@@ -1036,11 +1472,12 @@ async function runWithThread({ entry, messages, threadType, webSearch, reasoning
         threadType,
         webSearch,
         reasoningEffort,
-        createThread: thread.createThread,
+        createThread: atts.length ? false : thread.createThread,
         reuse: thread.reused,
+        attachmentSteps,
       });
       const parsed = await executeInference(payload, null, {
-        threadId: thread.createThread ? null : thread.threadId,
+        threadId: atts.length || !thread.createThread ? thread.threadId : null,
       });
       recordThreadResult(thread, parsed.usage);
       return { parsed, thread };
@@ -1050,6 +1487,11 @@ async function runWithThread({ entry, messages, threadType, webSearch, reasoning
         log('复用会话失败，改为新建会话重试:', e.message);
         resetThreadState();
         thread = acquireThread('single');
+        let attachmentSteps = [];
+        if (atts.length) {
+          await createThreadRecord(thread.threadId);
+          attachmentSteps = await stepsFor(thread.threadId);
+        }
         const payload = buildPayload({
           entry,
           messages,
@@ -1057,10 +1499,13 @@ async function runWithThread({ entry, messages, threadType, webSearch, reasoning
           threadType,
           webSearch,
           reasoningEffort,
-          createThread: true,
+          createThread: atts.length ? false : true,
           reuse: false,
+          attachmentSteps,
         });
-        const parsed = await executeInference(payload, null, { threadId: null });
+        const parsed = await executeInference(payload, null, {
+          threadId: atts.length ? thread.threadId : null,
+        });
         recordThreadResult(thread, parsed.usage);
         return { parsed, thread };
       }
@@ -1069,7 +1514,7 @@ async function runWithThread({ entry, messages, threadType, webSearch, reasoning
   });
 }
 
-function buildPayload({ entry, messages, threadId, threadType, webSearch, reasoningEffort, createThread, reuse }) {
+function buildPayload({ entry, messages, threadId, threadType, webSearch, reasoningEffort, createThread, reuse, attachmentSteps }) {
   const spaceId = state.workspace.spaceId;
   const userId = state.cred.notion_user_id || state.workspace.userId || '';
   const now = new Date().toISOString();
@@ -1077,6 +1522,15 @@ function buildPayload({ entry, messages, threadId, threadType, webSearch, reason
   const dialog = messages.filter((m) => m.role !== 'system' && m.content);
   // 复用已有 Notion 会话时只发最新一条 user 消息（历史在服务端会话里）
   const sendDialog = reuse ? dialog.slice(-1) : dialog;
+  const steps = Array.isArray(attachmentSteps) ? attachmentSteps.filter(Boolean) : [];
+  // 附件 step 需要紧跟在其所属的（最后一条）user 消息前面
+  let lastUserIndex = -1;
+  for (let i = sendDialog.length - 1; i >= 0; i--) {
+    if (sendDialog[i].role === 'user') {
+      lastUserIndex = i;
+      break;
+    }
+  }
 
   const configValue = {
     type: threadType,
@@ -1086,6 +1540,8 @@ function buildPayload({ entry, messages, threadId, threadType, webSearch, reason
     searchScopes: [{ type: 'everything' }],
   };
   if (reasoningEffort) configValue.reasoningEffort = reasoningEffort;
+  // 有文本类附件（computer-file）时，让 AI 能用 computer 工具读取文件
+  if (steps.some((s) => s && s.type === 'computer-file')) configValue.enableComputer = true;
 
   const transcript = [
     { id: uuid(), type: 'config', value: configValue },
@@ -1110,15 +1566,17 @@ function buildPayload({ entry, messages, threadId, threadType, webSearch, reason
   }
 
   let firstUser = true;
-  for (const msg of sendDialog) {
+  sendDialog.forEach((msg, index) => {
     if (msg.role === 'assistant') {
       transcript.push({
         id: uuid(),
         type: 'agent-inference',
         value: [{ type: 'text', content: msg.content }],
       });
-      continue;
+      return;
     }
+    // 最后一条 user 消息前插入附件 step（没有附件时 steps 为空数组）
+    if (index === lastUserIndex && steps.length) transcript.push(...steps);
     let content = msg.content;
     if (firstUser && systemMode === 'prefix' && sysTexts.length) {
       content = sysTexts.join('\n\n') + '\n\n' + content;
@@ -1131,7 +1589,7 @@ function buildPayload({ entry, messages, threadId, threadType, webSearch, reason
       userId,
       createdAt: now,
     });
-  }
+  });
 
   const isNewThread = createThread !== undefined ? !!createThread : !threadId;
   return {
@@ -1380,6 +1838,10 @@ async function handleChatCompletions(req, res) {
   }
   const threadId = body.thread_id || (body.metadata && (body.metadata.thread_id || body.metadata.notion_thread_id)) || null;
   const threadMode = resolveThreadMode(body, req);
+  const attachments = extractOpenAIAttachments(body.messages);
+  if (attachments.length && !cfg.enableAttachments) {
+    throw new HttpError(400, '附件支持已关闭（config.enableAttachments=false）');
+  }
 
   await acquireSlot();
   const startedAt = Date.now();
@@ -1393,6 +1855,7 @@ async function handleChatCompletions(req, res) {
       reasoningEffort,
       threadId,
       mode: threadMode,
+      attachments,
     }));
   } finally {
     releaseSlot();
@@ -1400,7 +1863,8 @@ async function handleChatCompletions(req, res) {
   const duration = ((Date.now() - startedAt) / 1000).toFixed(1);
   log(
     `chat model=${body.model || entry.id}(${entry.code}) stream=${stream} ` +
-      `thread=${threadMode} content=${parsed.content.length}字 耗时=${duration}s`
+      `thread=${threadMode}${attachments.length ? ` attachments=${attachments.length}` : ''} ` +
+      `content=${parsed.content.length}字 耗时=${duration}s`
   );
 
   const responseId = `chatcmpl-${uuid()}`;
@@ -1521,6 +1985,10 @@ async function handleAnthropicMessages(req, res) {
   const webSearch = body.web_search !== undefined ? !!body.web_search : !!cfg.useWebSearch;
   const threadId = body.thread_id || (body.metadata && body.metadata.thread_id) || null;
   const threadMode = resolveThreadMode(body, req);
+  const attachments = extractAnthropicAttachments(body.messages);
+  if (attachments.length && !cfg.enableAttachments) {
+    throw new HttpError(400, '附件支持已关闭（config.enableAttachments=false）');
+  }
 
   await acquireSlot();
   let parsed;
@@ -1533,6 +2001,7 @@ async function handleAnthropicMessages(req, res) {
       reasoningEffort: null,
       threadId,
       mode: threadMode,
+      attachments,
     }));
   } finally {
     releaseSlot();

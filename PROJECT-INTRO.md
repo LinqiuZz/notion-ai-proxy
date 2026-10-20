@@ -33,9 +33,10 @@ Notion AI 只能在网页里用，而 Cherry Studio、Cursor、各类 SDK、Code
 | 批量处理 | `examples/batch_process.py` 按目录/glob 批量请求，结果写 `.md` |
 | 自动改代码（有限） | `examples/auto_agent.py`：用文本 JSON 工具协议让模型列目录、读文件、替换文件，默认 dry-run + 自动备份 |
 | 多模型对比 | 同一客户端里切换 Opus 5.5、GPT-6.1、Gemini 3.x、Kimi K3 等 |
+| 图片 / 文件理解 | 传截图、PDF、代码文件给模型；OpenAI `image_url`/`file`、Anthropic `image`/`document` 两种协议都支持 |
 | 学习逆向/代理 | `docs/upstream-spec.md` 记录了完整的上游协议分析 |
 
-不适合：依赖**原生**工具调用的 Agent（Cursor Agent、Claude Code 的自动改文件等）、图片输入、多人共享、生产流量、对外售卖 API。这些是上游能力边界，不是配置问题（`examples/auto_agent.py` 的文本协议只覆盖「读文件 / 改文件」这类有限操作，不能执行命令）。
+不适合：依赖**原生**工具调用的 Agent（Cursor Agent、Claude Code 的自动改文件等）、多人共享、生产流量、对外售卖 API。这些是上游能力边界，不是配置问题（`examples/auto_agent.py` 的文本协议只覆盖「读文件 / 改文件」这类有限操作，不能执行命令）。图片/文件附件**已支持**（见 README 5.8），但仍受网页接口限制：单文件 ≤14MB、只取最后一条 user 消息的附件。
 
 ## 3. 整体架构
 
@@ -151,7 +152,7 @@ curl.exe -sS -N --max-time 300 -X POST https://app.notion.com/api/v3/runInferenc
 | 批量目录/glob 处理 | ✅ | `batch_process.py`，仅标准库 |
 | 自动改文件（agent 脚本） | ✅（脚本侧协议） | `auto_agent.py` 用文本 JSON 协议模拟工具调用；4 轮完成一次实测改写，dry-run + 备份；加 `--allow-exec` 后可跑测试/编译（默认关闭） |
 | tools / function calling | ❌ | 上游不提供；相关客户端只能当聊天用 |
-| 图片、文件上传 | ❌ 代理未实现 | 上游 Notion AI 支持附件（有专用上传接口 `getUploadFileUrlForAssistantChatTranscriptUpload`），但附件在 transcript 中的引用格式未抓取，代理目前只发纯文本 |
+| 图片、文件附件 | ✅ 已实现（2026-10） | 图片/PDF 走 `attachment` step（视觉/文档解析），文本类文件走 `computer-file` step（computer 工具读取）；OpenAI `image_url`/`file`、Anthropic `image`/`document` 均支持；`threadMode=new` 时自动先建空 thread 再上传 |
 | 真流式逐字输出 | ❌ | 当前是伪流式 |
 
 ## 6. 接口说明
@@ -251,6 +252,7 @@ notion-proxy.exe --refresh            :: 从浏览器调试端口刷新登录态
 | `apiKey` | `""` | 留空不校验 |
 | `autoRefreshCookie` / `validateOnStart` | `true` / `true` | 401 自动刷新、启动校验 |
 | `threadMode` / `threadReuseMaxTurns` / `threadReuseMaxInputTokens` | `"new"` / `30` / `300000` | 会话复用开关与轮数/输入 token 轮换阈值 |
+| `enableAttachments` / `attachmentMaxBytes` | `true` / `14680064` | 是否允许附件；单个附件大小上限（14MB） |
 | `systemPromptMode` / `streamMode` | `"prefix"` / `"pseudo"` | system prompt 模式；伪流式（当前仅此一种，字段保留） |
 | `debugSaveRaw` / `maxBodyBytes` | `false` / `33554432` | 保存原始 NDJSON（含对话内容）；请求体上限 32MB |
 
@@ -259,7 +261,7 @@ notion-proxy.exe --refresh            :: 从浏览器调试端口刷新登录态
 | 限制 | 影响 |
 |---|---|
 | 不支持 tools / function calling | Codex、Claude Code、Cursor Agent 不能真正执行工具 |
-| 不支持图片/文件 | 只能纯文本对话 |
+| 附件有限制 | 单文件 ≤14MB；只取最后一条 user 消息里的附件；文本类文件需要模型能用 computer 工具 |
 | 采样参数被忽略 | `temperature`、`max_tokens` 等无效 |
 | 伪流式 | 首字延迟取决于完整生成时间，不是逐字输出 |
 | 默认无状态（可 single 复用） | 默认每请求新建线程；single 缓解会话堆积，但上下文/token 累积 |

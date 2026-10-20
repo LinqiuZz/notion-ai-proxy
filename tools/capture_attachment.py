@@ -8,24 +8,27 @@ Notion 网页 AI 支持在对话里附带图片/文件，代理目前只实现�
 （getUploadFileUrlForAssistantChatTranscriptUpload），但"附件在 runInferenceTranscript 请求体里
 怎么引用"还没抓到。这个脚本用 CDP 监听浏览器网络请求，把相关请求体保存下来。
 
+连接方式
+--------
+Edge/Chrome 有时会关掉 HTTP 的 /json 接口（返回 404），所以这里**直连浏览器 WebSocket**
+（从 DevToolsActivePort 读端口和路径），用 Target.getTargets / attachToTarget 找到 Notion 标签页。
+
 用法
 ----
-1. 完全关闭 Edge/Chrome，然后用调试端口启动并登录 Notion：
+1. 浏览器用调试端口启动（Edge 需完全关闭后重启）：
 
        "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" --remote-debugging-port=9222
 
-2. 打开 https://app.notion.com 的 AI 对话，**先不要发消息**。
+2. 打开 https://app.notion.com 的 AI 对话，先别发消息。
 
-3. 运行本脚本：
+3. 运行：python tools\\capture_attachment.py
 
-       python tools\\capture_attachment.py
+4. 在浏览器里：附一张小图片（或 txt）→ 发一条消息（例如"这张图里有什么？"）。
 
-4. 在浏览器里：附件随便选一张小图片（或一个 txt），发一条消息（比如"这张图里有什么？"）。
-
-5. 等模型开始回复后，回到脚本按 Ctrl+C 停止；它会保存到：
+5. 等模型开始回复，回到脚本按 Ctrl+C 停止；结果写到：
        .tmp/capture/attachment-capture-<时间戳>.json
 
-脚本只读本地调试端口，不会修改任何东西；抓到的内容可能含你的对话文字，注意不要外传。
+注意：抓到的请求体可能含你的对话文字，只在本机 .tmp 目录（已 gitignore），不要外传。
 """
 
 from __future__ import annotations
@@ -53,15 +56,15 @@ BROWSER_DIRS = [
 CAPTURE_HINTS = (
     "runInferenceTranscript",
     "getUploadFileUrl",
-    "getUploadFileUrlForAssistantChatTranscriptUpload",
     "submitTransaction",
     "saveTransactions",
     "syncRecordValues",
+    "loadPageChunk",
 )
 API_HINT = "/api/v3/"
 
 
-def find_debug_port() -> int | None:
+def find_debug_port() -> tuple[int, str] | None:
     for ud in BROWSER_DIRS:
         f = ud / "DevToolsActivePort"
         if not f.is_file():
@@ -69,58 +72,103 @@ def find_debug_port() -> int | None:
         try:
             lines = f.read_text(encoding="utf-8").strip().splitlines()
             port = int(lines[0])
-            if port > 0:
-                return port
+            ws_path = lines[1].strip() if len(lines) > 1 else ""
+            if port > 0 and ws_path.startswith("/devtools/"):
+                return port, ws_path
         except (ValueError, IndexError, OSError):
             continue
     return None
 
 
-def http_json(url: str):
-    with urllib.request.urlopen(url, timeout=5) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+class BrowserCdp:
+    """直连浏览器级 WebSocket（Target 域），再 attach 到具体页面。"""
 
-
-def pick_target(port: int) -> dict | None:
-    try:
-        targets = http_json(f"http://127.0.0.1:{port}/json")
-    except Exception as exc:
-        print(f"读取 http://127.0.0.1:{port}/json 失败：{exc}")
-        return None
-    pages = [t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
-    notion = [t for t in pages if "notion" in (t.get("url") or "").lower()]
-    if notion:
-        return notion[0]
-    if pages:
-        print("没找到 Notion 标签页，使用第一个标签页：", pages[0].get("url"))
-        return pages[0]
-    return None
-
-
-class CdpCapture:
     def __init__(self, ws_url: str) -> None:
-        self.ws = websocket.create_connection(ws_url, timeout=5, suppress_origin=True)
+        self.ws = websocket.create_connection(ws_url, timeout=10, suppress_origin=True)
         self.next_id = 0
         self.pending: dict[int, dict] = {}
-        self.records: list[dict] = []
-        self.by_request: dict[str, dict] = {}
+        self.session_id: str | None = None
 
-    def send(self, method: str, params: dict | None = None) -> int:
+    def send(self, method: str, params: dict | None = None, session_id: str | None = None) -> int:
         self.next_id += 1
         msg = {"id": self.next_id, "method": method}
         if params:
             msg["params"] = params
+        if session_id:
+            msg["sessionId"] = session_id
         self.ws.send(json.dumps(msg))
         self.pending[self.next_id] = {"method": method, "params": params or {}}
         return self.next_id
 
-    def handle(self, msg: dict) -> None:
+    def wait_result(self, msg_id: int, timeout: float = 10.0) -> dict:
+        deadline = time.time() + timeout
+        self.ws.settimeout(1.0)
+        while time.time() < deadline:
+            try:
+                raw = self.ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            if not raw:
+                continue
+            msg = json.loads(raw)
+            if msg.get("id") == msg_id:
+                return msg.get("result") or {}
+        return {}
+
+    def pick_notion_target(self) -> dict | None:
+        msg_id = self.send("Target.getTargets")
+        result = self.wait_result(msg_id)
+        pages = [t for t in result.get("targetInfos", []) if t.get("type") == "page"]
+        notion = [t for t in pages if "notion" in (t.get("url") or "").lower()]
+        if notion:
+            # 优先 /chat 页面（AI 对话）
+            notion.sort(key=lambda t: 0 if "/chat" in (t.get("url") or "") else 1)
+            return notion[0]
+        return pages[0] if pages else None
+
+    def attach(self, target_id: str) -> str | None:
+        msg_id = self.send("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+        return (self.wait_result(msg_id).get("sessionId")) or None
+
+
+def main() -> int:
+    found = find_debug_port()
+    if not found:
+        print("没找到 DevToolsActivePort。请完全关掉 Edge/Chrome 后用调试端口启动：")
+        print('  msedge.exe --remote-debugging-port=9222')
+        return 1
+    port, ws_path = found
+    browser_url = f"ws://127.0.0.1:{port}{ws_path}"
+    print(f"浏览器调试端口: {port}")
+    print(f"连接: {browser_url}")
+
+    try:
+        cdp = BrowserCdp(browser_url)
+    except Exception as exc:
+        print(f"连不上浏览器 WebSocket：{exc}")
+        return 1
+
+    target = cdp.pick_notion_target()
+    if not target:
+        print("没找到可用的页面标签页，请先打开 https://app.notion.com 的 AI 对话。")
+        return 1
+    print(f"目标标签页: {target.get('url')}")
+    session_id = cdp.attach(target["targetId"])
+    if not session_id:
+        print("attachToTarget 失败（无法接管该标签页）。")
+        return 1
+    print(f"已接管标签页 session={session_id[:12]}…")
+
+    records: list[dict] = []
+    by_request: dict[str, dict] = {}
+
+    def on_message(msg: dict) -> None:
         method = msg.get("method")
         params = msg.get("params") or {}
         if method == "Network.requestWillBeSent":
             request = params.get("request") or {}
             url = request.get("url") or ""
-            if API_HINT in url and any(h in url for h in CAPTURE_HINTS):
+            if API_HINT in url and any(hint in url for hint in CAPTURE_HINTS):
                 record = {
                     "ts": datetime.now().isoformat(timespec="seconds"),
                     "method": request.get("method"),
@@ -130,76 +178,58 @@ class CdpCapture:
                     "responseStatus": None,
                     "responseBody": None,
                 }
-                self.records.append(record)
-                self.by_request[params["requestId"]] = record
-                self.send("Network.getRequestPostData", {"requestId": params["requestId"]})
+                records.append(record)
+                by_request[params["requestId"]] = record
+                cdp.send("Network.getRequestPostData", {"requestId": params["requestId"]}, session_id)
                 print(f"[请求] {record['method']} {url.split('?')[0]}")
         elif method == "Network.responseReceived":
-            request_id = params.get("requestId")
-            record = self.by_request.get(request_id)
+            record = by_request.get(params.get("requestId"))
             if record:
                 response = params.get("response") or {}
                 record["responseStatus"] = response.get("status")
                 record["mimeType"] = response.get("mimeType")
                 print(f"[响应] {record['responseStatus']} {record['url'].split('?')[0]}")
                 if "UploadFileUrl" in record["url"]:
-                    self.send("Network.getResponseBody", {"requestId": request_id})
-        elif "id" in msg and msg["id"] in self.pending:
-            info = self.pending.pop(msg["id"])
-            method = info["method"]
+                    cdp.send("Network.getResponseBody", {"requestId": params.get("requestId")}, session_id)
+        elif "id" in msg and msg["id"] in cdp.pending:
+            info = cdp.pending.pop(msg["id"])
             result = msg.get("result") or {}
-            if method == "Network.getRequestPostData":
-                for record in self.records:
-                    if record.get("requestId") == info["params"].get("requestId"):
+            request_id = info["params"].get("requestId")
+            if info["method"] == "Network.getRequestPostData":
+                for record in records:
+                    if record.get("requestId") == request_id:
                         record["postData"] = result.get("postData")
-            elif method == "Network.getResponseBody":
-                for record in self.records:
-                    if record.get("requestId") == info["params"].get("requestId"):
+            elif info["method"] == "Network.getResponseBody":
+                for record in records:
+                    if record.get("requestId") == request_id:
                         record["responseBody"] = result.get("body")
 
-    def run(self, seconds: float) -> None:
-        self.send("Network.enable")
-        deadline = time.time() + seconds
-        self.ws.settimeout(1.0)
-        while time.time() < deadline:
-            try:
-                raw = self.ws.recv()
-            except websocket.WebSocketTimeoutException:
-                continue
-            except KeyboardInterrupt:
-                break
-            if not raw:
-                continue
-            try:
-                self.handle(json.loads(raw))
-            except json.JSONDecodeError:
-                continue
-        self.ws.close()
-
-
-def main() -> int:
-    port = find_debug_port()
-    if not port:
-        print("没找到 DevToolsActivePort。请先完全关掉 Edge/Chrome，再用调试端口启动：")
-        print('  msedge.exe --remote-debugging-port=9222')
-        return 1
-    target = pick_target(port)
-    if not target:
-        print("没有可用的页面标签页。请先打开 https://app.notion.com 的 AI 对话。")
-        return 1
-
-    print(f"浏览器调试端口: {port}")
-    print(f"目标标签页: {target.get('url')}")
+    cdp.send("Network.enable", {}, session_id)
     print()
     print("现在请去浏览器里：附一张小图片（或 txt）→ 发一条消息 → 等模型开始回复。")
     print("完成后回到这里按 Ctrl+C 停止抓包。")
     print("-" * 70)
 
-    cap = CdpCapture(target["webSocketDebuggerUrl"])
+    cdp.ws.settimeout(1.0)
     try:
-        cap.run(600)
+        while True:
+            try:
+                raw = cdp.ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            if not raw:
+                continue
+            try:
+                on_message(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
     except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            cdp.ws.close()
+        except Exception:
+            pass
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUT_DIR / f"attachment-capture-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
@@ -208,18 +238,18 @@ def main() -> int:
             {
                 "capturedAt": datetime.now().isoformat(timespec="seconds"),
                 "target": target.get("url"),
-                "records": cap.records,
+                "records": records,
             },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
-    interesting = [r for r in cap.records if r.get("postData")]
+    with_body = [r for r in records if r.get("postData")]
     print()
-    print(f"共抓 {len(cap.records)} 个相关请求，其中 {len(interesting)} 个有请求体")
+    print(f"共抓 {len(records)} 个相关请求，其中 {len(with_body)} 个有请求体")
     print(f"已保存：{out}")
-    for record in cap.records:
+    for record in records:
         print(f"  {record.get('responseStatus')} {record.get('method')} {record['url'].split('?')[0]}")
     return 0
 

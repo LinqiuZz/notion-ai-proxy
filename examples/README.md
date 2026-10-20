@@ -1,6 +1,6 @@
 # examples — 使用示例
 
-这里的四个脚本都假设**代理已经在运行**（双击项目根目录的 `start-proxy.cmd`，等窗口出现 `就绪`）。
+这里的脚本都假设**代理已经在运行**（双击项目根目录的 `start-proxy.cmd`，等窗口出现 `就绪`）。
 默认地址是 `http://127.0.0.1:8787/v1`，默认模型是 `claude-sonnet4.6`。
 
 > 更完整的说明（客户端配置、模型列表、常见问题、安全提示）请看上一级目录的 [README.md](../README.md)。
@@ -8,6 +8,7 @@
 | 文件 | 用途 | 运行方式 |
 |---|---|---|
 | `openai_python.py` | 用官方 `openai` SDK 调代理：列模型、非流式、流式 | `python examples\openai_python.py`（需 `pip install openai`） |
+| `attach_image.py` | 发图片 / 文件附件（OpenAI `image_url`/`file`、Anthropic `image`） | `python examples\attach_image.py`（只用标准库） |
 | `curl_chat.cmd` | 用 Windows 自带 `curl.exe` 调代理，含中文请求 | 双击，或 `examples\curl_chat.cmd` |
 | `batch_process.py` | 批量处理一个目录/一批文件，结果存成 `.md` | 见下方命令 |
 | `auto_agent.py` | 让 AI 自动读文件、改文件（dry-run + 备份） | 见下方命令 |
@@ -37,7 +38,32 @@ set NOTION_MODEL=claude-opus5
 python examples\openai_python.py
 ```
 
-## 2. curl_chat.cmd
+## 2. attach_image.py（图片 / 文件附件）
+
+只用 Python 标准库。演示三种写法，默认三项依次跑一遍：
+
+```bat
+:: 默认：用内置 1×1 红色小图 + 一段示例文本文件
+python examples\attach_image.py
+
+:: 用你自己的图片
+python examples\attach_image.py --image C:\path\to\screenshot.png
+
+:: 复用某个 Notion 会话（同一个对话里追问同一张图）
+python examples\attach_image.py --thread <thread-id>
+
+:: 只跑其中一项
+python examples\attach_image.py --only file
+```
+
+行为说明：
+
+- 图片 / PDF / Office 文档 → 走 Notion 的 `attachment` step，模型直接“看”图或解析文档；
+- 文本类文件（`.txt .md .csv .json .py ...`）→ 走 `computer-file` step，模型用 computer 工具读取；
+- 单文件上限由 `config.json` 的 `attachmentMaxBytes` 控制（默认 14MB）；
+- 附件只取**最后一条 user 消息**里的，历史消息里的附件不会重发。
+
+## 3. curl_chat.cmd
 
 双击即可。它会依次请求 `/health`、`/v1/models`、`/v1/chat/completions`（中文请求体）。
 
@@ -51,7 +77,7 @@ examples\curl_chat.cmd http://127.0.0.1:9000
 
 > 脚本里已经执行了 `chcp 65001`，所以中文请求不会乱码。手动在 cmd 里粘贴中文 JSON 容易乱码，建议直接用这个脚本。
 
-## 3. batch_process.py（批量处理）
+## 4. batch_process.py（批量处理）
 
 只依赖 Python 标准库，**不需要** `pip install`。它会把每个文件的内容套进 `--prompt` 模板，
 发给本地代理处理，结果写到 `--out-dir`，文件名是「原文件名 + `.md`」，并保留目录结构。
@@ -88,7 +114,7 @@ out\src\utils\db.ts.md
 python examples\batch_process.py --help
 ```
 
-## 4. auto_agent.py（自动改代码）
+## 5. auto_agent.py（自动改代码）
 
 `batch_process.py` 只产出文本；`auto_agent.py` 会**直接修改文件**。模型本身没有工具调用能力，
 脚本用「文本 JSON 协议」模拟：模型每轮只输出一个 JSON 代码块（如 `{"tool": "read_file", "path": "a.py"}`），

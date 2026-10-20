@@ -52,7 +52,7 @@ http://127.0.0.1:8787/v1
 | 不支持的能力 | 说明 |
 |---|---|
 | 原生 `tools` / function calling | Notion 网页接口不提供原生工具调用，Cursor 的 Agent 这类客户端用不了；但 `examples/auto_agent.py` 用「文本 JSON 协议」在本地执行读写文件，能实现**有限的自动改代码** |
-| 图片 / 文件上传 | **代理尚未实现**：Notion 网页 AI 本身支持附件，上游有专门的 `getUploadFileUrlForAssistantChatTranscriptUpload` 上传接口（见 `docs/upstream-spec.md` 附件一节），但"附件在 transcript 里怎么引用"还没抓到位，所以本代理目前只发送纯文本 |
+| 图片 / 文件附件 | ✅ **已支持**（2026-10 实测）：OpenAI 的 `image_url` / `file` part、Anthropic 的 `image` / `document` block；支持本地文件（base64）、`data:` URL、公网 URL。图片/PDF 走 `attachment` step，文本类文件（txt/md/csv/json/代码等）走 `computer-file` step。限制见 [5.8](#58-发图片--文件附件) |
 | `temperature`、`max_tokens` 等采样参数 | 会被忽略，不生效 |
 | `/v1/embeddings`、`/v1/images`、`/v1/audio` | 未实现 |
 | 给别的电脑/手机远程使用 | 默认只绑定 `127.0.0.1`，而且**强烈不建议**改成对其他设备开放 |
@@ -319,6 +319,56 @@ cc-switch 里已经内置两个供应商（Claude + Codex），都指向本地 `
 - **Codex**：直接指向本地 8787 的 Responses 接口。
 
 注意：Claude 的「自动故障转移」已经关闭（否则会切到旧的 401 供应商）；如果要在 cc-switch 里重新打开，请自行评估风险。
+
+### 5.8 发图片 / 文件（附件）
+
+代理已实现 Notion 网页 AI 的附件上传（2026-10 抓包逆向后完整打通），客户端只要按标准协议传附件即可：
+
+**OpenAI 协议（`/v1/chat/completions`）**
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="sk-local", timeout=600.0)
+b64 = base64.b64encode(open("screenshot.png", "rb").read()).decode()
+
+resp = client.chat.completions.create(
+    model="opus-5.5",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "这张截图里有什么问题？"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ],
+    }],
+)
+print(resp.choices[0].message.content)
+```
+
+文本/代码文件用 `file` part（UTF-8 文本按 base64 传，或直接传 `file_data`）：
+
+```python
+{"type": "file", "file": {"filename": "main.py", "file_data": base64.b64encode(src).decode(), "mime_type": "text/plain"}}
+```
+
+**Anthropic 协议（`/v1/messages`，Claude Code 用）**
+
+```python
+{"type": "image",   "source": {"type": "base64", "media_type": "image/png", "data": b64}}
+{"type": "document","source": {"type": "base64", "media_type": "application/pdf", "data": b64}}
+```
+
+**行为说明**
+
+- 图片、PDF、Office 文档 → `attachment` step，模型用视觉/文档解析直接读；
+- 文本类文件（`.txt .md .csv .json .py .js .ts …`）→ `computer-file` step，模型用 computer 工具读取；
+- 附件只取**最后一条 user 消息**里的；同一个请求里可以带多个附件（顺序保留）；
+- 单文件上限 `attachmentMaxBytes`（默认 14MB）；Notion 签名策略本身允许到 20MB；
+- **会话绑定**：附件 fileUrl 与 thread 绑定，跨 thread 引用会「图片加载不出来」，所以代理在需要时会先在 Notion 建一个空 thread（`saveTransactionsFanout`）再上传——`threadMode=new` 也能正常用附件，只在 Notion 里多一条正常对话，不会多建无用会话；
+- `thread_id` 显式指定时附件会直接传到该会话，适合「同一个 Notion 对话里连续追问同一张图」。
+
+> 附件会原样上传到 Notion 的存储（S3），**不要传密钥、客户隐私、/未公开合同**；`secret/` 目录下的凭据文件更不要作为附件发送。
 
 ---
 
@@ -632,6 +682,14 @@ node notion-proxy.js --port 9000
 
 ---
 
+### 9.13 附件上传失败 / 模型说「图片加载不出来」
+
+- **`413` / 提示附件过大**：调大 `config.json` 的 `attachmentMaxBytes`，但不要超过 20MB（S3 签名策略上限）；
+- **模型说看不到附件内容**：确认附件是放在**最后一条 user 消息**里（历史消息里的附件不会重新上传）；
+- **PDF/图片能读、txt 读不到**：文本类文件走 `computer-file` + computer 工具读取，需要模型支持工具调用（Opus/GPT 系列都可以）；
+- **`502` 附件上传失败**：多半是登录态过期或附件接口临时异常，先跑 `update-cookie.cmd`，再重试；
+- **附件会留在 Notion 存储里**：想彻底删除请到 Notion 对话里删掉那条消息，或在 Notion 设置里清理上传文件。
+
 ## 10. 安全与风险提示
 
 **请务必阅读。** 这个工具把浏览器里的登录态变成了 API，属于本机自用工具，有明确风险边界。
@@ -693,6 +751,7 @@ ai-proxy/
 ├─ .gitignore                 # 忽略 secret/、node_modules/、日志等
 ├─ examples/
 │  ├─ openai_python.py        # openai SDK 示例（非流式 + 流式）
+│  ├─ attach_image.py         # 图片/文件附件示例（OpenAI + Anthropic 两种协议）
 │  ├─ curl_chat.cmd           # curl 示例（含中文请求）
 │  ├─ batch_process.py        # 批量处理工具（仅标准库）
 │  ├─ auto_agent.py           # 自动改代码 agent（文本 JSON 工具协议，dry-run + 备份）
@@ -758,6 +817,8 @@ ai-proxy/
 | `threadMode` | `"new"` | 会话模式：`"new"` 每个请求新建会话；`"single"` 复用同一个会话 |
 | `threadReuseMaxTurns` | `30` | `single` 模式下同一会话最多复用轮数，超过换新会话 |
 | `threadReuseMaxInputTokens` | `300000` | `single` 模式下输入超过该 token 数就换新会话 |
+| `enableAttachments` | `true` | 是否允许图片/文件附件（走 Notion 专用上传接口，见 5.8） |
+| `attachmentMaxBytes` | `14680064` | 单个附件大小上限（14MB）；Notion 签名策略本身允许到 20MB |
 | `requestTimeoutMs` | `300000` | 单次上游请求超时（毫秒） |
 | `useWebSearch` | `false` | 是否默认开启联网搜索 |
 | `includeReasoning` | `true` | 是否在响应里附带模型的思考内容（`reasoning_content`） |

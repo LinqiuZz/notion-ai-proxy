@@ -352,33 +352,125 @@ pragma: no-cache
 > assistant 历史消息用 `agent-inference`，`value` 是 **对象数组**（`[{type:"text",content}]`），
 > **不是** `[[text]]`。这是两种不同的 rich-text 表示，写错会被忽略或 400。
 
-### 4.3.1 附件上传（图片 / 文件，部分逆向）
+### 4.3.1 附件上传（图片 / 文件，2026-10 完整逆向，已验证）
 
-Notion 网页 AI 支持在对话里附带文件/图片，走专用上传接口（证据：`ref/app_notion_js/UISpacePermissionGroupToken-*.js`）：
+Notion 网页 AI 支持在对话里附带图片/文件。完整链路 4 步（本代理已实现，`notion-proxy.js` 的「附件」一节）：
 
 1. **申请签名 URL**：`POST /api/v3/getUploadFileUrlForAssistantChatTranscriptUpload`
 
    ```json
    {
-     "name": "a.png",
+     "name": "<uuid4>.<ext>",
      "contentType": "image/png",
-     "contentLength": 12345,
-     "assistantChatTranscriptSessionPointer": {"...": "会话指针，含 spaceId/threadId 等"},
+     "contentLength": 70,
+     "assistantChatTranscriptSessionPointer": {"spaceId": "<spaceId>", "table": "thread", "id": "<threadId>"},
      "createThread": true,
-     "threadType": "workflow",
-     "workflowId": "可选",
-     "agentMemorySettings": "可选",
-     "allowUnsupportedTypes": false
+     "agentMemorySettings": {"useMemories": true, "excludeChatFromMemories": false}
    }
    ```
 
-2. **上传文件**：响应的 `data` 里含 `signedUploadPostUrl`（S3 POST 地址）、`postHeaders`
-   （`[{name,value}]`）、`fields`，以及上传完成后的 `url` 和 `signedToken`。
-   浏览器用 `FormData` 把 `fields` + `file` 提交到 `signedUploadPostUrl`，成功后拿 `data.url` 作为文件地址。
+   响应：`{url: "attachment:<uuid>:<uuid>.<ext>", signedGetUrl, signedUploadPostUrl, postHeaders: [], fields: {...S3 表单字段...}}`。
 
-3. **未确认**：transcript 里如何引用该附件——是直接把 `url` 放进 `user` block，
-   还是先 `submitTransaction` 建 `image` / `file_upload` block 再让 AI 读取，尚未抓到。
-   需要一次「带附件的 `runInferenceTranscript`」抓包（方法见 `tools/capture_attachment.py`）。
+   ⚠️ **`assistantChatTranscriptSessionPointer.id` 必须是一个已存在的 thread id**：随机 uuid / null / 空字符串 /
+   `table:"space"` / `table:"block"` 全部返回 400 ValidationError。所以新会话要发附件，必须先建 thread（见第 5 步）。
+
+2. **上传文件实体**：multipart POST 到 `signedUploadPostUrl`（`https://prod-files-secure.s3.us-west-2.amazonaws.com/`），
+   表单字段顺序照抄 `fields`，`file` 部分放**最后**，文件名用第 1 步的 `name`。成功返回 **204**（无 body）。
+
+3. **登记附件**：`POST /api/v3/processAgentAttachment`
+
+   ```json
+   {
+     "url": "attachment:...",
+     "spaceId": "<spaceId>",
+     "aiSessionPointer": {"spaceId": "<spaceId>", "table": "thread", "id": "<threadId>"},
+     "permissionRecord": {"spaceId": "<spaceId>", "table": "thread", "id": "<threadId>"},
+     "source": "user_upload",
+     "clientVersion": "<notion-client-version>",
+     "model": "<模型代号>"
+   }
+   ```
+
+   返回 `{outputKey, spaceId}`；失败可以忽略（上传本身已完成，实测不影响图片被看到）。
+
+4. **在 `runInferenceTranscript` 的 transcript 里引用**：在**最后一条 user block 之前**插入附件 block。
+   抓包实测有两种类型，按文件性质自动选：
+
+   **二进制/图片/PDF → `attachment`**
+
+   ```json
+   {
+     "id": "<uuid>",
+     "type": "attachment",
+     "fileUrl": "attachment:<uuid>:<uuid>.png",
+     "fileName": "red.png",
+     "contentType": "image/png",
+     "metadata": {
+       "width": 1, "height": 1, "fileSizeBytes": 70,
+       "attachmentSource": "user_upload",
+       "aiTraceId": "<uuid>",
+       "guardrail": {"inferenceId": "<uuid>", "attachmentRisk": "skipped"},
+       "moderation": {"status": "passed"},
+       "estimatedTokens": {"openai": 765, "anthropic": 0.0013}
+     },
+     "base64EncodedFileUrl": ""
+   }
+   ```
+
+   **文本类文件（.txt/.md/.csv/.json/代码等）→ `computer-file`**
+
+   ```json
+   {
+     "id": "<uuid>",
+     "type": "computer-file",
+     "fileUrl": "attachment:<uuid>:<uuid>.txt",
+     "fileName": "note.txt",
+     "contentType": "text/plain",
+     "metadata": {"fileSize": 53, "attachmentSource": "user_upload"}
+   }
+   ```
+
+   并且 `config.value` 里要带 `"enableComputer": true`，模型才会用 computer 工具
+   （实测流程：`connections.computer.uploadFile` 上传到 `/data/xxx` → `connections.computer.terminal` 执行
+   `cat /data/xxx` 读取内容）。
+
+   > 注意 `fileName` 用**原始文件名**（用于模型识别），`fileUrl` 里的文件名是服务端生成的 uuid 名。
+   > 文本类 metadata 用 `fileSize`（不是 `fileSizeBytes`），且不需要 `guardrail`/`moderation`/`estimatedTokens`。
+   > 纯附件、没有文字时 user block **不带 `value` 字段**；带文字时仍是 `value: [["..."]]`。
+
+5. **新会话的 thread 引导（重要）**：因为上传必须绑定已存在的 thread，而 `createThread:true` 的
+   `runInferenceTranscript` 是「边建 thread 边推理」，没机会先上传。做法是先用
+   `POST /api/v3/saveTransactionsFanout` 建一条空 thread record，再上传，最后用 `createThread:false` + 该 threadId 推理：
+
+   ```json
+   {
+     "requestId": "<uuid>",
+     "transactions": [{
+       "id": "<uuid>",
+       "spaceId": "<spaceId>",
+       "debug": {"userAction": "WorkflowActions.createThread", "clientCommitTimeMs": 1234567890123},
+       "operations": [{
+         "pointer": {"table": "thread", "id": "<threadId>", "spaceId": "<spaceId>"},
+         "path": [], "command": "set",
+         "args": {"id": "<threadId>", "version": 0, "space_id": "<spaceId>", "parent_id": "<spaceId>",
+                  "parent_table": "space", "created_by_id": "<userId>", "created_by_table": "notion_user",
+                  "created_time": 1234567890123, "messages": [], "data": {}}
+       }]
+     }]
+   }
+   ```
+
+   返回 `{}`（成功）；随后 `getRecordValues` 能查到该 thread（version 1，`alive:true`）。
+   实测「建空 thread → 上传 → `createThread:false` 推理」全链路通，模型能正确读图/读文件。
+
+6. **会话绑定（坑）**：`fileUrl` 是 thread 作用域的。把 A 会话上传的 `fileUrl` 放进 B 会话的 transcript，
+   模型会回答「图片没能加载出来」——HTTP 200、流正常，只是内容为空。所以每个会话都必须用自己的上传结果。
+
+7. **限制**：S3 签名策略 `content-length-range` 上限 20MB（代理默认限制 14MB）；附件只在 transcript 当前轮生效，
+   历史轮的附件不会自动重发。
+
+> 证据：`tools/capture_attachment.py`（CDP 抓包工具）抓到的 `runInferenceTranscript` 请求体；
+> 以及独立 TS/JS 复现脚本（上传 204 → processAgentAttachment → 带 attachment step 的推理返回图片颜色）。
 
 ### 4.4 `config.value` 字段表（模型 / 思考 / 搜索）
 
