@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────
+# 本机登录凭据（token_v2 等）：绝对不要提交、不要外传、不要截图
+# ─────────────────────────────────────────────────────────────
+secret/
+
+# Node 依赖
+node_modules/
+
+# 日志文件
+*.log
+
+# 临时目录
+.tmp/
+
+# 参考源码 / 抓包资料（体积大，不参与版本管理）
+ref/
+
+# 批量处理输出（examples/batch_process.py 默认写到这里）
+out/
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 调试保存的原始流（config.json 里 debugSaveRaw=true 时产生）
+secret/debug/
+
+# 打包生成的 exe（体积大，可按需重新构建：tools/build-exe.ps1）
+notion-proxy.exe
+*.exe
+
+# auto_agent.py 的自动备份目录
+.autoedit-backup/
+
+# 系统/编辑器杂项
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

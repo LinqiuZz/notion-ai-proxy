@@ -1,0 +1,32 @@
+{
+  "port": 8787,
+  "bind": "127.0.0.1",
+  "upstreamHost": "https://app.notion.com",
+  "curlPath": "curl.exe",
+  "python": "python",
+  "credentialFile": "secret/credential.json",
+  "workspaceFile": "secret/workspace.json",
+  "refreshScript": "tools/cdp_cookie_extract.py",
+  "apiKey": "",
+  "defaultModel": "opus-5.5",
+  "defaultThreadType": "workflow",
+  "markdownChatModels": [
+    "vertex-gemini-3.5-flash"
+  ],
+  "useWebSearch": false,
+  "includeReasoning": true,
+  "streamMode": "pseudo",
+  "requestTimeoutMs": 300000,
+  "maxBodyBytes": 33554432,
+  "maxConcurrent": 2,
+  "retries": 2,
+  "autoRefreshCookie": true,
+  "validateOnStart": true,
+  "debugSaveRaw": false,
+  "systemPromptMode": "prefix",
+  "clientVersion": "23.13.20260720.1949",
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+  "threadMode": "new",
+  "threadReuseMaxTurns": 30,
+  "threadReuseMaxInputTokens": 300000
+}

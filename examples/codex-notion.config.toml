@@ -1,0 +1,8 @@
+model = "opus-5.5"
+model_provider = "notion"
+
+[model_providers.notion]
+name = "Notion AI (local proxy)"
+base_url = "http://127.0.0.1:8787/v1"
+env_key = "NOTION_PROXY_KEY"
+wire_api = "responses"
