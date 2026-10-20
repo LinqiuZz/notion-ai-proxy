@@ -132,11 +132,17 @@ python examples\auto_agent.py --task "给 utils.py 里所有函数加中文 docs
 
 :: 4) 改完自己跑测试验证（命令执行默认关闭，需 --allow-exec）
 python examples\auto_agent.py --task "修复 test_math.py 失败的用例，改完跑 pytest 验证" --dir src --max-steps 10 --apply --allow-exec
+
+:: 5) 推荐：--test-cmd 自动测试闭环（不用教模型跑命令，脚本每次改完自动跑测试并回传结果）
+python examples\auto_agent.py --dir . --apply --test-cmd "python -m pytest -q" --task "修到测试全绿"
+python examples\auto_agent.py --dir . --apply --test-cmd "npm test -- --runInBand" --task "修到测试全绿"
 ```
 
 参数：`--task`（必填）、`--dir`（工作目录，只允许改这个目录）、`--apply`（真正写盘）、
 `--model`（默认 `opus-5.5`）、`--max-steps`（默认 8）、`--thread-mode`（默认 `single`，复用 Notion 会话）、
-`--allow-exec`（允许跑命令，默认关闭）、`--exec-timeout`（命令超时，默认 120 秒）。
+`--allow-exec`（允许跑命令，默认关闭）、`--exec-timeout`（命令超时，默认 120 秒）、
+`--test-cmd`（自动测试命令，固定字符串，模型改不了；启动时先跑基线，之后每次改完自动重跑）、
+`--test-timeout`（自动测试超时，默认 300 秒）。
 
 安全：默认 dry-run；写盘前自动备份；只改 `--dir` 内文件；拒绝 `secret/`、`.git/`、`node_modules/` 等目录；
 不会删文件。命令执行默认关闭，加 `--allow-exec` 后才有 `exec` 工具，并且带破坏性命令黑名单（删除 / 格式化 / `git push` 等）、

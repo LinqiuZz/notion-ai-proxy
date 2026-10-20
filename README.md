@@ -521,6 +521,8 @@ python examples\auto_agent.py --task "把 greet.py 的返回值改成 hi + name"
 | `--thread-mode` | `single` | 复用同一个 Notion 会话（省对话数） |
 | `--allow-exec` | 关 | 允许模型在 `--dir` 下跑命令（测试/编译检查），**默认关闭** |
 | `--exec-timeout` | `120` | 单条命令超时秒数 |
+| `--test-cmd` | 空 | **自动测试命令**（固定字符串，如 `python -m pytest -q`）：启动时先跑一次基线，之后每次改完文件自动再跑并把结果回传模型；模型改不了这条命令 |
+| `--test-timeout` | `300` | 自动测试命令的超时秒数 |
 
 安全与限制：
 
@@ -536,6 +538,18 @@ python examples\auto_agent.py --task "把 greet.py 的返回值改成 hi + name"
 ```bat
 python examples\auto_agent.py --task "修复 test_math.py 里失败的用例，改完跑 pytest 验证" --dir src --max-steps 10 --apply --allow-exec
 ```
+
+**推荐用 `--test-cmd` 做「自动测试闭环」**：不用教模型跑命令，脚本会在每次改完后自己跑测试、把结果喂回模型：
+
+```bat
+:: 启动时先跑一次 pytest 记录基线，之后每改一个文件就自动重跑，直到全绿再 finish
+python examples\auto_agent.py --dir . --apply --test-cmd "python -m pytest -q" ^
+  --task "把 greet() 改成返回 hello {name}，让测试全绿" --max-steps 8
+```
+
+实测：初始 `2 failed` → AI 读文件 → 改 `greet.py` → 脚本自动 `pytest` 得到 `2 passed` → 模型读到结果后 `finish`，
+全程 4 轮、改 1 个文件、无人工干预。`--test-cmd` 是启动时写死的命令，模型无法修改，比让模型自由 `exec` 安全；
+它**不需要** `--allow-exec`（模型没有命令执行权，只是脚本按固定命令跑测试）。
 
 更多示例见 [`examples/README.md`](examples/README.md)，或运行：
 

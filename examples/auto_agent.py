@@ -19,6 +19,8 @@ notion-proxy 只提供纯文本对话（上游 Notion 没有原生 tool use / fu
 * 只允许操作 --dir 目录内的文件；拒绝 .git / secret / node_modules 等目录。
 * 命令执行默认关闭：只有显式加 --allow-exec 才允许模型跑测试/命令；带破坏性命令黑名单、
   超时（默认 120 秒）和输出截断（4000 字符），命令在 --dir 目录下执行。
+* 自动测试：加 --test-cmd "python -m pytest -q" 后，脚本会在启动时先跑一次基线，
+  之后**每次改完文件自动再跑一遍**，把结果回传给模型；这条命令由用户写死，模型改不了。
 * 单文件读取上限 512KB、读取行数上限 400 行，避免上下文爆炸。
 * 默认 thread_mode=single（复用同一个 Notion 会话），减少 Notion 里新建对话的数量。
   注意：复用会话时每次请求都会把整个会话上下文重读一遍，输入 token 大约每轮涨 3~4 万；
@@ -29,7 +31,8 @@ notion-proxy 只提供纯文本对话（上游 Notion 没有原生 tool use / fu
 ----
     python auto_agent.py --task "把 greet.py 的返回值改成 hi" --dir ./src --apply
     python auto_agent.py --task "给这个目录的 Python 文件都加上类型注解" --dir . --max-steps 20
-    python auto_agent.py --task "解释 main.py 的作用" --dir . --dry-run-only
+    python auto_agent.py --task "解释 main.py 的作用" --dir .
+    python auto_agent.py --task "修到测试全绿" --dir . --apply --test-cmd "python -m pytest -q"
 """
 
 from __future__ import annotations
@@ -84,7 +87,7 @@ IGNORE_DIRS = {
     "build",
 }
 
-def build_system_prompt(allow_exec: bool) -> str:
+def build_system_prompt(allow_exec: bool, test_cmd: str = "") -> str:
     tools = [
         '1. 列文件：{"tool": "list_files", "path": ".", "pattern": "*.py"}',
         '2. 读文件：{"tool": "read_file", "path": "a.py", "start": 1, "end": 200}',
@@ -110,6 +113,11 @@ def build_system_prompt(allow_exec: bool) -> str:
         rules.append("- exec 一次只跑一条命令，命令在 --dir 目录下执行，输出过长会被截断。")
     else:
         rules.append("- 你不能执行命令，只能读写文件。")
+    if test_cmd:
+        rules.append(
+            "- 脚本已配置自动测试（%s）：每次你修改文件后会自动执行它，并把结果发给你。"
+            "测试失败就继续修，测试通过后尽快调用 finish。" % test_cmd
+        )
     rules.extend(
         [
             "- 如果信息不足，继续 read_file 或 list_files；任务完成后立刻调用 finish。",
@@ -152,6 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python auto_agent.py --task \"把 greet.py 的返回值改成 hi\" --dir ./src --apply\n"
             "  python auto_agent.py --task \"给所有 py 文件加类型注解\" --dir . --max-steps 20\n"
             "  python auto_agent.py --task \"修复失败的测试并跑 pytest 验证\" --dir . --apply --allow-exec\n"
+            "  python auto_agent.py --task \"修到测试全绿\" --dir . --apply --test-cmd \"python -m pytest -q\"\n"
             "\n注意: 默认只预览不写盘，确认无误后加 --apply。\n"
         ),
     )
@@ -175,6 +184,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="允许模型在 --dir 目录下执行命令（跑测试/编译检查）。默认关闭，有破坏性命令黑名单和超时限制",
     )
     parser.add_argument("--exec-timeout", type=float, default=120.0, help="单条命令超时秒数，默认 120")
+    parser.add_argument(
+        "--test-cmd",
+        default="",
+        help=(
+            "自动测试命令（固定字符串，如 \"python -m pytest -q\"）：启动时先跑一次记录基线，"
+            "之后每次改完文件自动再跑，并把结果回传给模型。模型不能修改它"
+        ),
+    )
+    parser.add_argument(
+        "--test-timeout", type=float, default=300.0, help="自动测试命令的超时秒数，默认 300"
+    )
     return parser
 
 
@@ -241,11 +261,22 @@ def chat(
 
 
 class Toolbox:
-    def __init__(self, root: Path, apply: bool, allow_exec: bool = False, exec_timeout: float = 120.0) -> None:
+    def __init__(
+        self,
+        root: Path,
+        apply: bool,
+        allow_exec: bool = False,
+        exec_timeout: float = 120.0,
+        test_cmd: str = "",
+        test_timeout: float = 300.0,
+    ) -> None:
         self.root = root
         self.apply = apply
         self.allow_exec = allow_exec
         self.exec_timeout = max(5.0, float(exec_timeout))
+        self.test_cmd = (test_cmd or "").strip()
+        self.test_timeout = max(5.0, float(test_timeout))
+        self.mutated = False  # 自上次自动测试后是否有文件写入成功
         self.stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.changed: list[str] = []
         self.backup_dir = root / ".autoedit-backup" / self.stamp
@@ -334,6 +365,7 @@ class Toolbox:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         self.changed.append(path.relative_to(self.root).as_posix())
+        self.mutated = True
         return "已写入 %s\n%s" % (path.relative_to(self.root).as_posix(), diff)
 
     def replace_in_file(self, args: dict) -> str:
@@ -364,7 +396,48 @@ class Toolbox:
         self.backup(path)
         path.write_text(new_text, encoding="utf-8")
         self.changed.append(path.relative_to(self.root).as_posix())
+        self.mutated = True
         return "已修改 %s%s\n%s" % (path.relative_to(self.root).as_posix(), note, diff)
+
+    def run_auto_test(self) -> str:
+        """执行 --test-cmd 指定的固定测试命令，返回给模型看的结果文本。
+
+        命令是用户在启动时写死的，模型无法修改；改完文件后由主循环自动触发。
+        """
+        if not self.test_cmd:
+            return "（未配置 --test-cmd）"
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        started = time.time()
+        try:
+            proc = subprocess.run(
+                self.test_cmd,
+                shell=True,
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.test_timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return "自动测试超时（> %.0f 秒），已终止：%s" % (self.test_timeout, self.test_cmd)
+        except OSError as exc:
+            return "自动测试启动失败：%s" % exc
+
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if len(output) > EXEC_MAX_OUTPUT:
+            output = output[:EXEC_MAX_OUTPUT] + "\n...（输出过长，已截断）"
+        verdict = "通过" if proc.returncode == 0 else "失败"
+        return "命令: %s\n结果: %s（退出码 %s）\n耗时: %.1fs\n输出:\n%s" % (
+            self.test_cmd,
+            verdict,
+            proc.returncode,
+            time.time() - started,
+            output or "（无输出）",
+        )
 
     def run_command(self, args: dict) -> str:
         if not self.allow_exec:
@@ -492,6 +565,8 @@ def main(argv: list[str] | None = None) -> int:
         apply=args.apply,
         allow_exec=args.allow_exec,
         exec_timeout=args.exec_timeout,
+        test_cmd=args.test_cmd,
+        test_timeout=args.test_timeout,
     )
 
     mode = "写盘模式" if args.apply else "dry-run（只预览，不写盘）"
@@ -500,17 +575,28 @@ def main(argv: list[str] | None = None) -> int:
     say("目录 : %s" % root)
     say("模型 : %s    会话: %s    模式: %s" % (args.model, args.thread_mode, mode))
     say("命令 : %s" % ("允许执行（--allow-exec）" if args.allow_exec else "禁止执行（默认）"))
+    say("测试 : %s" % ("改完自动跑 -> %s" % args.test_cmd if args.test_cmd else "未配置（加 --test-cmd 可自动跑测试）"))
     say("上限 : %d 轮工具调用" % args.max_steps)
     say("=" * 70)
-    system_prompt = build_system_prompt(args.allow_exec)
+    system_prompt = build_system_prompt(args.allow_exec, args.test_cmd)
 
     def make_observation(step: int, payload: str) -> str:
         # 每轮都重复任务，防止会话轮换后模型丢失目标
         return "[第 %d 轮] 任务：%s\n\n%s" % (step, args.task, payload)
 
+    # 自动测试：先跑一次记录基线（让模型知道初始哪些用例本来就是坏的）
+    baseline_note = ""
+    if args.test_cmd:
+        say("\n──── 自动测试（基线，改动前）────")
+        say("▶ %s" % args.test_cmd)
+        baseline = toolbox.run_auto_test()
+        say(baseline[:2000])
+        baseline_note = "\n\n改动前的自动测试基线结果：\n\n%s" % baseline
+
     observation = make_observation(
         1,
-        "工作目录：%s\n请先列目录，再读相关文件，然后修改。完成后调用 finish。" % root,
+        "工作目录：%s\n请先列目录，再读相关文件，然后修改。完成后调用 finish。" % root
+        + baseline_note,
     )
 
     finished = False
@@ -565,7 +651,16 @@ def main(argv: list[str] | None = None) -> int:
             say("\n任务完成：%s" % summary)
             break
         say(result[:1500])
-        observation = make_observation(step + 1, "工具结果（%s）：\n\n%s" % (tool_name, result))
+        payload = "工具结果（%s）：\n\n%s" % (tool_name, result)
+        # 改完文件后自动跑测试，把结果一起喂给模型（模型自己不能改这条命令）
+        if toolbox.test_cmd and toolbox.mutated:
+            toolbox.mutated = False
+            say("\n──── 自动测试（改动后）────")
+            say("▶ %s" % toolbox.test_cmd)
+            test_result = toolbox.run_auto_test()
+            say(test_result[:2000])
+            payload += "\n\n自动测试结果（%s）：\n\n%s" % (toolbox.test_cmd, test_result)
+        observation = make_observation(step + 1, payload)
 
     say("\n" + "=" * 70)
     if finished:
