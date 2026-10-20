@@ -352,6 +352,34 @@ pragma: no-cache
 > assistant 历史消息用 `agent-inference`，`value` 是 **对象数组**（`[{type:"text",content}]`），
 > **不是** `[[text]]`。这是两种不同的 rich-text 表示，写错会被忽略或 400。
 
+### 4.3.1 附件上传（图片 / 文件，部分逆向）
+
+Notion 网页 AI 支持在对话里附带文件/图片，走专用上传接口（证据：`ref/app_notion_js/UISpacePermissionGroupToken-*.js`）：
+
+1. **申请签名 URL**：`POST /api/v3/getUploadFileUrlForAssistantChatTranscriptUpload`
+
+   ```json
+   {
+     "name": "a.png",
+     "contentType": "image/png",
+     "contentLength": 12345,
+     "assistantChatTranscriptSessionPointer": {"...": "会话指针，含 spaceId/threadId 等"},
+     "createThread": true,
+     "threadType": "workflow",
+     "workflowId": "可选",
+     "agentMemorySettings": "可选",
+     "allowUnsupportedTypes": false
+   }
+   ```
+
+2. **上传文件**：响应的 `data` 里含 `signedUploadPostUrl`（S3 POST 地址）、`postHeaders`
+   （`[{name,value}]`）、`fields`，以及上传完成后的 `url` 和 `signedToken`。
+   浏览器用 `FormData` 把 `fields` + `file` 提交到 `signedUploadPostUrl`，成功后拿 `data.url` 作为文件地址。
+
+3. **未确认**：transcript 里如何引用该附件——是直接把 `url` 放进 `user` block，
+   还是先 `submitTransaction` 建 `image` / `file_upload` block 再让 AI 读取，尚未抓到。
+   需要一次「带附件的 `runInferenceTranscript`」抓包（方法见 `tools/capture_attachment.py`）。
+
 ### 4.4 `config.value` 字段表（模型 / 思考 / 搜索）
 
 | 字段 | 值 | 说明 |

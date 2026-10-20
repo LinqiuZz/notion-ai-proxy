@@ -52,7 +52,7 @@ http://127.0.0.1:8787/v1
 | 不支持的能力 | 说明 |
 |---|---|
 | 原生 `tools` / function calling | Notion 网页接口不提供原生工具调用，Cursor 的 Agent 这类客户端用不了；但 `examples/auto_agent.py` 用「文本 JSON 协议」在本地执行读写文件，能实现**有限的自动改代码** |
-| 图片 / 文件上传 | 只支持纯文本消息 |
+| 图片 / 文件上传 | **代理尚未实现**：Notion 网页 AI 本身支持附件，上游有专门的 `getUploadFileUrlForAssistantChatTranscriptUpload` 上传接口（见 `docs/upstream-spec.md` 附件一节），但"附件在 transcript 里怎么引用"还没抓到位，所以本代理目前只发送纯文本 |
 | `temperature`、`max_tokens` 等采样参数 | 会被忽略，不生效 |
 | `/v1/embeddings`、`/v1/images`、`/v1/audio` | 未实现 |
 | 给别的电脑/手机远程使用 | 默认只绑定 `127.0.0.1`，而且**强烈不建议**改成对其他设备开放 |

@@ -151,7 +151,7 @@ curl.exe -sS -N --max-time 300 -X POST https://app.notion.com/api/v3/runInferenc
 | 批量目录/glob 处理 | ✅ | `batch_process.py`，仅标准库 |
 | 自动改文件（agent 脚本） | ✅（脚本侧协议） | `auto_agent.py` 用文本 JSON 协议模拟工具调用；4 轮完成一次实测改写，dry-run + 备份；加 `--allow-exec` 后可跑测试/编译（默认关闭） |
 | tools / function calling | ❌ | 上游不提供；相关客户端只能当聊天用 |
-| 图片、文件上传 | ❌ | 只支持纯文本 |
+| 图片、文件上传 | ❌ 代理未实现 | 上游 Notion AI 支持附件（有专用上传接口 `getUploadFileUrlForAssistantChatTranscriptUpload`），但附件在 transcript 中的引用格式未抓取，代理目前只发纯文本 |
 | 真流式逐字输出 | ❌ | 当前是伪流式 |
 
 ## 6. 接口说明
